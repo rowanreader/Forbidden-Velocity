@@ -1,11 +1,14 @@
 import cv2
 import numpy as np
 import random
+from PIL import Image as im
 import matplotlib.pyplot as plt
 import matplotlib.animation as ani
 
+random.seed(1)
+
 # dimension the map is shrunk to
-dim = 15
+dim = 300
 # converts image into map, returns map as 2D array
 # _ = empty space, X = known obstacle
 def makeMap(file):
@@ -103,11 +106,9 @@ class Heap():
                 self.heapify((2*pos) + 1)
 
 
-
-
     # push item onto heap
     def push(self, node):
-        # this is the position of the new node - acutally just size of the heap + 1
+        # this is the position of the new node - actually just size of the heap + 1
         current = self.heap[0] + 1
 
         x = node.x
@@ -201,12 +202,18 @@ class AStarNode():
 def euclid(p1, p2):
     return np.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
 
+def manhattan(p1, p2):
+    return np.abs(p1[0] - p2[0]) + np.abs(p1[1] + p2[1])
+
 # takes in map, start location, stop location
 # locations are tuples
 # decides path using A*, returns path as array of tuples
 # g will be linear, h will be euclidean distance
 # can move to all 8 pixels/nodes surrounding current
-def Astar(map, start, end):
+# note that end and start are reversed. This is cuz the path starts looking from start
+# so when it retraces its steps it ends at the start. Swapping these parameters fixes it
+# (I could swap variables but i only just got it working)
+def Astar(map, end, start):
     # initialize start node
     startNode = AStarNode(start, None, 0, 0)
     # initialize queues, open one must be ordered so make it a min heap
@@ -249,27 +256,214 @@ def Astar(map, start, end):
 
                     g = current.G + 1 # assume each step is same
                     # find euclidian distance between prospective node and end goal
-                    h = euclid([newX, newY], end)
+                    # h = euclid([newX, newY], end)
+                    # manhattan has less jagged turns
+                    h = manhattan([newX, newY], end)
                     # make new node, add to queue
                     openQueue.push(AStarNode([newX, newY], current, g, h))
         closedQueue.append(current)
+
+# takes in figure handle, center coordinates, radius, and colour, draws a circle
+# for the asthetic(tm)
+def draw(map, coords, radius, colour):
+    for angle in range(0, 360, 5):
+        x = int(round(radius * np.sin(np.radians(angle)) + coords[0]))
+        y = int(round(radius * np.cos(np.radians(angle)) + coords[1]))
+        if x >= 0 and y >= 0 and x < dim and y < dim:
+            map[x][y] = colour
+    return map
+
+# takes in current velocity of roomba, obstacle information, plan, and timestep (index of plan we're on)
+# startVelocity is maximum velocity, cannot go faster
+# also takes in radius of roomba and obstacles
+# checks that path is collision free based on distance and relative velocities
+# if collision, calculates how much you must slow
+def forbiddenVelocity(velocity, obstacles, plan, step, startVelocity, rRad, oRad):
+    # deceleration from breaking in terms of pixels/timestep (also acceleration)
+    breaking = 1
+    n = len(obstacles)
+    # once step gets too close to total, just use the rest of the path to fit a line, not set number
+    total = len(plan)
+    # initialize array for calculating relative velocities, distance, and time until collision
+    # note - collision is defined as when the obstacle collides with the current path.
+    # if no collision will occur, is inf
+    # if obstacle is not moving (based on delay), is inf
+    # current path is based on current trajectory - 2 linear lines intersecting
+    # line based on current and future (5 steps?)
+    # time is number of timesteps - once close to thresh, start slowing down
+    relativeVelocities = np.zeros(n)
+    dists = np.zeros(n)
+    times = np.zeros(n)
+    # iterate through obstacles, calculate
+    for i in range(n):
+        # check that obstacle is moving, and that it is still in play
+        if obstacles[i].delay >= step and obstacles[i].x != np.inf:
+            # for relative velocity, must take into account direction of roomba and obstacle
+            # get roomba velocity based on current and next step
+            temp = np.array(plan[step+1]) - np.array(plan[step])
+            norm = np.sqrt(temp[0]**2 + temp[1]**2)
+            rDir = velocity*temp/norm # this is x,y vector
+            # get obstacles velocity
+            # d is angle. Must convert
+            oDir = [obstacles[i].v*np.cos(obstacles[i].d),obstacles[i].v*np.sin(obstacles[i].d)]
+            # get relative velocity from reference frame of roomba
+            relative = oDir-rDir
+            # convert to linear velocity
+            # record so can compare
+            relativeVelocities[i] = np.sqrt(relative[0]**2 + relative[1]**2)
+            # based on distance of obstacle and relative velocities, find number of timesteps
+            times[i] = relativeVelocities[i]/breaking
+            # already past, no collision will occur, move on to next obstacle
+            if times[i] <= 0:
+                times[i] = np.inf
+                dists[i] = np.inf
+                continue
+            # how far the point of intersection is
+            # convert to standard from parametric form
+            ar = rDir[1]
+            br = rDir[0]
+            cr = -br*plan[step][0] + ar*plan[step][1]
+            ao = oDir[1]
+            bo = oDir[0]
+            co = -bo*obstacles[i].x + ao*obstacles[i].y
+            # use cross product to get intersection
+            intersect = np.cross([ar,br,cr],[ao,bo,co])
+            z = intersect[2]
+            if z != 0: # there is an intersection
+                intersect = intersect/z # must get in form of (x,y,1)
+                # distance is from obstacle x y to intersect, taking into account radii of roomba and obstacles too
+                dists[i] = abs(np.sqrt((obstacles[i].x - intersect[0])**2 + (obstacles[i].y - intersect[1])**2) - rRad - oRad)
+            else: # no intersection
+                dists[i] = np.inf
+                times[i] = np.inf
+        else:
+            relativeVelocities[i] = np.NINF
+            times[i] = np.inf
+            dists[i] = np.inf
+
+    # now based on relative velocities and distances, figure out time to collision
+    # if time to collision is within 1 or 2 timesteps (so based on current velocity), start breaking
+    # (return velocity reduced by breaking)
+    # otherwise, return maximum speed up to default
+    maxVelocity = velocity # start here, search through for max
+    # if get through entire loop without any risk of collision, speed up
+    slowFlag = 0
+    #print(velocity)
+    for i in range(n):
+        if times[i] != np.inf:
+            #print(i)
+            time = dists[i]/relativeVelocities[i]
+            #print()
+            if time <= times[i] + velocity:
+                # if maximum velocity is less than the slower velocity this would warrant, skip, otherwise replace
+                if velocity - breaking < maxVelocity:
+                    slowFlag = 1
+                    maxVelocity = velocity - breaking
+                    print("Slowing down for obstacle " + str(i))
+
+    if slowFlag == 0:
+        maxVelocity = maxVelocity + breaking
+        if maxVelocity > startVelocity:
+            maxVelocity = startVelocity
+            return maxVelocity
+        print("Speeding up")
+    #print(maxVelocity)
+    return maxVelocity
 
 
 # takes in the map, the A* plan+angle, roomba velocity, and a list of all the obstacles (for simulation purposes)
 # moves roomba and obstacles, observes field and may change velocity to slow down according to forbidden map
 # if moving/unexpected obstacles, applies modification to path
 # obstacles have x, y, v, d (coordinates, lin velocity, direction in degrees)
-def move(map, plan, velocity, obstacles):
-    img = plt.imshow(map)
-    plt.plot(map[0],map[1])
-    while True:
-        # draw each step
+def move(originalMap, plan, velocity, obstacles):
+    # start velocity saved as maximum
+    startVelocity = velocity
+    flag = True # gets switched to False once end point reached
+    # find how many steps are in the path
+    num = len(plan)
+    # plot the path
+    for i in range(num):
+        # grey out path
+        originalMap[plan[i][0]][plan[i][1]] = 0.5
 
-        # assess obstacles and self, calculate forbidden velocity map, if necessary, change velocity
+    originalMap = np.multiply(originalMap, 255)
+    # hope theres no aliasing
+    map = originalMap # convert to numpy array
 
-        # move 1 time step (1 sec?)
-        # if exceeds plan, set to final goal (can have obstacles still move tho), draw last time, return
-        pass
+    fig = plt.figure(1)
+    moviewriter = ani.PillowWriter()
+    x = plan[0][0] # start position of the roomba
+    y = plan[0][1]
+    # roomba colour, can go from 0 to 255
+    rColour = 200
+    # obstacle color
+    oColour = 200
+    # radius of obstacles and roomba
+    oRad = 10
+    rRad = 20
+    numObstacles = len(obstacles)
+    count = 0 # where in path the roomba is
+    timer = 0 # counts for when the obstacles on delay start moving
+    with moviewriter.saving(fig, 'Roomba.gif', dpi=100):
+        while flag:
+            # using the velocities and direction of the moving obstacles, adjusts velocity to avoid collision on path
+            # ignores obstacles since path avoids them and stationary obstacles don't exist for moving obstacles
+            velocity = forbiddenVelocity(velocity, obstacles, plan, count, startVelocity, rRad, oRad)
+
+            # redraw (and recreate map) map
+            map = np.array(originalMap)
+            # draw each step
+            map[x][y] = rColour
+            for i in range(numObstacles):
+                # only move if number of timesteps is greater than delay
+                # prevents far away obstacles from moving before the roomba gets close
+                # helps the roomba encounter more obstacles so that you can acutally see the forbidden velocity thing
+                if obstacles[i].delay >= timer:
+                    xo = obstacles[i].x
+                    yo = obstacles[i].y
+
+                    # if xo is 0 then the obstacle has left the map - skip this obstacle
+                    if xo == np.inf:
+                        continue
+                    map[xo][yo] = oColour
+                    vo = obstacles[i].v
+                    do = obstacles[i].d
+
+                    # draw circle around obstacle center, only draw if obstacle moving
+                    map = draw(map, [obstacles[i].x, obstacles[i].y], oRad, oColour)
+
+                    # change x and y of the obstacles based on v and d (v and d will always be the same)
+                    # because I'm doing a grid, simplify by rounding.
+                    newX = int(np.round(xo + vo*np.cos(do)))
+                    newY = int(np.round(yo + vo*np.sin(do)))
+
+                    if newX < 0 or newX >= dim or newY < 0 or newY >= dim:
+                        obstacles[i].x = np.inf # just set x, no need to also set y
+                    else:
+                        obstacles[i].x = newX
+                        obstacles[i].y = newY
+            timer += 1
+            # assess obstacles and self, calculate forbidden velocity map, if necessary, change velocity
+            # assume velocity is constant for now
+            # velocity is how many steps of the path it skips
+            count += velocity
+            # if exceeds, just go to end point
+            if count >= num:
+                x = plan[num-1][0]
+                y = plan[num-1][1]
+                map = draw(map, plan[num-1], rRad, rColour)
+                flag = False
+            else:
+                x = plan[count][0]
+                y = plan[count][1]
+                map = draw(map, plan[count], rRad, rColour)
+            # send map into drawing function to be drawn correctly
+
+            plt.imshow(map, vmin=0, vmax=255)
+            moviewriter.grab_frame()
+            # clear frame to redraw
+            plt.clf()
+        moviewriter.finish()
 
 
 # angle is dependent on the direction between 1 point and another
@@ -278,52 +472,67 @@ def getAngle(plan):
     for i in range(num):
         dx = plan[i][0] - plan[i+1][0]
         dy = plan[i][1] - plan[i+1][1]
-        # find the 4 quadrant angle, convert to degrees
-        angle = np.rad2deg(np.arctan(dy, dx))
+        # check if dx is 0 -> 90 degrees
+        if dx == 0:
+            angle = np.pi/2
+        elif dy == 0:
+            angle = 0
+        else:
+            # find the angle in radians
+            angle = np.arctan(dy/dx)
         plan[i].append(angle) # add angle to list
     return plan
 
 
 class Obstacle:
-    # everything is randomly initialized as defalt, though you can pass it hard values
-    def __init__(self, x=random.randint(0,dim), y=random.randint(0,dim), v=random.randint(0,20), d=random.randint(0,360)):
+    # everything is randomly initialized as default, though you can pass it hard values
+    def __init__(self, plan, x=None, y=None, v=None, d=None, delay=None):
         # x and y are current coordinates
+        if x is None:
+            x = random.randint(0, dim-1)
+        if y is None:
+            y = random.randint(0, dim-1)
+        if v is None:
+            v = random.randint(1,8)
+        if d is None:
+            d = random.random()*2*np.pi
+        if delay is None:
+            delay = random.randint(0, len(plan))
         self.x = x
         self.y = y
         # v is linear velocity
         self.v = v
-        # direction is angle in degrees wrt global coords
+        # direction is angle in rad wrt global coords
         self.d = d
-
+        # number of timesteps before obstacle starts moving
+        self.delay = delay
 
 def main():
     image = "OccupancyMapDrawn.png"
-    numObstacles = 10 # a number of these likely won't be in the way
+    numObstacles = 100 # a number of these likely won't be in the way
     # simulation time will be for as long as the roomba requires to reach goal. Velocity is pixels/timestep
     # so velocity of 1 does every single step. Velocity of 2 does every other etc.
-    velocity = 10
+    velocity = 5
 
     # converts image to 0's and 1's
     # 0 is empty, 1 is blocked
     map = makeMap(image)
     # !!!!!!!! get these in a better way later - interactive clicking. can do in makeMap?
     # also, make sure they are in an array, not a tuple!!!
-    start = [10,10]
-    end = [25,25]
+    start = [5,5]
+    end = [245,245]
 
     # this plan is just x,y coordinates of A* path
     plan = Astar(map, start, end)
-    print("Here2!")
-    # plan becomes (x,y,th), as we need the angle of the roomba too
-    plan = getAngle(plan)
+    # plan becomes (x,y,th), as we need the angle of the roomba too for drawing purposes
+    #plan = getAngle(plan)
     # get obstacles - random start point initialization, random constant velocities (including directions)
-    # each row is an obstacle, consisting of x, y, linear velocity, angle (in degrees)
-    obstacles = [Obstacle() for i in range(numObstacles)]
-
+    # each row is an obstacle, consisting of x, y, linear velocity, angle (in degrees), delay in timesteps before moving
+    obstacles = [Obstacle(plan) for _ in range(numObstacles)]
     # send map and plan into move, along with roomba velocity and obstacles
     move(map, plan, velocity, obstacles)
 
-#main()
+main()
 
 # test heap works
 # run with smaller map maybe?
